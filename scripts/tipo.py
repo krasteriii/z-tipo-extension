@@ -35,7 +35,7 @@ from kgen.executor.tipo import (
     parse_tipo_request,
     tipo_runner,
 )
-from kgen.formatter import apply_format, seperate_tags
+from kgen.formatter import apply_format, seperate_tags, tag_lists
 from kgen.logging import logger
 from kgen.metainfo import TIPO_DEFAULT_FORMAT
 
@@ -67,6 +67,26 @@ DEFAULT_FORMAT = """<|special|>,
 <|general|>, 
 
 <|quality|>, <|meta|>, <|rating|>"""
+# Anima's tag order: quality/meta/year/safety, 1girl etc, character, series,
+# artist, general tags. Natural language can follow the tags.
+ANIMA_FORMAT_NAME = "Anima"
+TIPO_DEFAULT_FORMAT = {
+    **TIPO_DEFAULT_FORMAT,
+    ANIMA_FORMAT_NAME: """<|quality|>, <|meta|>, <|rating|>,
+<|special|>, <|characters|>, <|copyrights|>, <|artist|>,
+
+<|general|>,
+
+<|extended|>.""",
+}
+# kgen only knows score_9 and score_N_up, so other score tags fell into the
+# general tags and lost their underscores. Anima also uses "worst quality" and
+# "year YYYY" next to the quality tags.
+tag_lists["quality"].update(
+    [f"score_{i}" for i in range(1, 10)]
+    + ["worst quality"]
+    + [f"year {year}" for year in range(2000, 2031)]
+)
 TIMING_INFO_TEMPLATE = (
     "_Prompt upsampling will be applied to {} "
     "sd-dynamic-promps and the webui's styles feature are applied_"
@@ -173,6 +193,23 @@ def embedding_spellings(tags) -> dict:
         for tag in tags
         if len(tag) >= 4 and "_" in tag and tag.lower() in known
     }
+
+
+def split_at_artists(tags):
+    """Anima marks artists with "@". "@_@" is an expression tag, not an artist."""
+    is_artist = [tag.startswith("@") and tag != "@_@" for tag in tags]
+    rest = [tag for tag, artist in zip(tags, is_artist) if not artist]
+    artists = [tag[1:].strip() for tag, artist in zip(tags, is_artist) if artist]
+    return rest, [name for name in artists if name]
+
+
+def categorize(tags, embeddings):
+    """seperate_tags, but a tag written with "@" stays an artist even when the
+    artist list lacks the name. Returns the map and whether any "@" was used."""
+    tags, at_artists = split_at_artists(tags)
+    tag_map = restore_embeddings(seperate_tags(tags), embeddings)
+    tag_map["artist"] += [name for name in at_artists if name not in tag_map["artist"]]
+    return tag_map, bool(at_artists)
 
 
 def restore_embeddings(tag_map, mapping):
@@ -834,11 +871,23 @@ class TIPOScript(scripts.Script):
                 continue
             for tag in part_tags:
                 strength_map[tag] = strength
+                # seperate_tags may respell "long_hair" as "long hair"
+                strength_map.setdefault(tag.replace("_", " "), strength)
 
         tag_length = tag_length.replace(" ", "_")
         nl_length = nl_length.replace(" ", "_")
-        embeddings = embedding_spellings(all_tags)
-        org_tag_map = restore_embeddings(seperate_tags(all_tags), embeddings)
+        # Negative weights (NegPiP) mark things to avoid, but TIPO only sees the
+        # bare words and would treat them as content. Hide those tags from it
+        # and put them back, weights included, after it's done.
+        neg_tags = list(
+            dict.fromkeys(tag for tag in all_tags if strength_map.get(tag, 1) < 0)
+        )
+        all_tags = [tag for tag in all_tags if strength_map.get(tag, 1) >= 0]
+        embeddings = embedding_spellings(all_tags + neg_tags)
+        # TIPO and its artist list know artists without the "@"
+        org_tag_map, has_at = categorize(all_tags, embeddings)
+        neg_tag_map, neg_has_at = categorize(neg_tags, embeddings)
+        use_at = has_at or neg_has_at or format_select == ANIMA_FORMAT_NAME
 
         meta, operations, general, nl_prompt = parse_tipo_request(
             org_tag_map,
@@ -867,6 +916,15 @@ class TIPOScript(scripts.Script):
             devices.torch_gc()
 
         tag_map = restore_embeddings(tag_map, embeddings)
+        for cate, tags in neg_tag_map.items():
+            for cate_map in (tag_map, org_tag_map):
+                current = cate_map.setdefault(cate, [])
+                current += [tag for tag in tags if tag not in current]
+        if use_at:
+            for cate_map in (tag_map, org_tag_map):
+                cate_map["artist"] = [f"@{name}" for name in cate_map.get("artist", [])]
+            for tag, strength in list(strength_map.items()):
+                strength_map.setdefault(f"@{tag}", strength)
         addon = {
             "tags": [],
             "nl": "",
